@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Attach multiple IP addresses to VMs
+# Attach multiple IP addresses to VMs using IP aliasing
 # Usage: ./attach-ip.sh <vm-name> <ip1,ip2,ip3,...> [network-name]
 
 set -e
@@ -15,9 +15,10 @@ show_usage() {
     echo "Examples:"
     echo "  $0 myvm 192.168.122.10                     # Single IP"
     echo "  $0 myvm 192.168.122.10,192.168.122.11     # Two IPs"
-    echo "  $0 myvm 192.168.122.10,192.168.122.11,192.168.122.12  # Three IPs"
+    echo "  $0 myvm 192.168.122.10,192.168.122.11,192.168.122.12  # Multiple IPs"
     echo ""
-    echo "Note: VM must be running. Use 'virsh net-list' to see available networks."
+    echo "Note: VM must be running. Uses IP aliasing to avoid PCI slot limits."
+    echo "      Use 'virsh net-list' to see available networks."
     exit 1
 }
 
@@ -62,53 +63,45 @@ if ! virsh net-list --all | grep -q "$NETWORK_NAME"; then
     exit 1
 fi
 
-echo "Attaching ${#IP_ARRAY[@]} IP addresses to VM: $VM_NAME"
+echo "Configuring ${#IP_ARRAY[@]} IP addresses for VM: $VM_NAME using IP aliasing"
 echo "IPs: ${IP_ARRAY[*]}"
 echo "Network: $NETWORK_NAME"
 
-# Get current interface count to determine starting interface names
+# Check current interfaces and ensure we have enp7s0 (7th interface)
 CURRENT_INTERFACES=$(virsh domiflist "$VM_NAME" | awk 'NR>2 && NF>0 {print $1}' | wc -l)
-echo "Debug: Current interface count: $CURRENT_INTERFACES"
+echo "Current interface count: $CURRENT_INTERFACES"
 
-# Attach the required number of interfaces and collect MAC addresses
-declare -a MAC_ARRAY
+# We need at least 7 interfaces to have enp7s0 (enp1s0, enp2s0, ..., enp7s0)
+TARGET_INTERFACE_COUNT=7
+if [ "$CURRENT_INTERFACES" -lt "$TARGET_INTERFACE_COUNT" ]; then
+    INTERFACES_TO_ADD=$((TARGET_INTERFACE_COUNT - CURRENT_INTERFACES))
+    echo "Adding $INTERFACES_TO_ADD interfaces to reach enp7s0..."
+    
+    for i in $(seq 1 $INTERFACES_TO_ADD); do
+        echo "Adding interface $i of $INTERFACES_TO_ADD..."
+        virsh attach-interface "$VM_NAME" network "$NETWORK_NAME" --model virtio --persistent
+        sleep 2
+    done
+    echo "All interfaces added successfully!"
+fi
+
+# Get the 7th interface MAC address (enp7s0)
+TARGET_INTERFACE_MAC=$(virsh domiflist "$VM_NAME" | awk 'NR==9 && NF>=5 {print $5}')
+echo "Using enp7s0 interface with MAC: $TARGET_INTERFACE_MAC for IP aliasing"
+
+# Create DHCP reservations for IP aliasing
+echo "Creating DHCP reservations for IP aliasing..."
 for i in "${!IP_ARRAY[@]}"; do
-    SLOT=$((CURRENT_INTERFACES + i + 6))  # Start from enp7s0
-    INTERFACE_NAME="enp${SLOT}s0"
-    
-    echo "Adding interface $INTERFACE_NAME for IP ${IP_ARRAY[$i]}..."
-    virsh attach-interface "$VM_NAME" network "$NETWORK_NAME" --model virtio --persistent
-    sleep 2  # Give time for interface to be created
-    
-    # Get the MAC address of the newly attached interface
-    # Get the last non-empty line with actual interface data
-    NEW_MAC=$(virsh domiflist "$VM_NAME" | awk 'NR>2 && NF>=5 {mac=$5} END {print mac}')
-    MAC_ARRAY[$i]="$NEW_MAC"
-    echo "Interface $INTERFACE_NAME has MAC: $NEW_MAC"
-    
-    # Debug: Show current domiflist output
-    echo "Debug: Current domiflist output:"
-    virsh domiflist "$VM_NAME"
-done
-
-echo "All interfaces attached successfully!"
-echo "MAC addresses collected: ${MAC_ARRAY[*]}"
-
-# Create DHCP reservations for each MAC→IP mapping
-echo "Creating DHCP reservations..."
-for i in "${!IP_ARRAY[@]}"; do
-    MAC="${MAC_ARRAY[$i]}"
     IP="${IP_ARRAY[$i]}"
-    SLOT=$((CURRENT_INTERFACES + i + 6))
-    HOST_NAME="${VM_NAME}-enp${SLOT}s0"
+    HOST_NAME="${VM_NAME}-enp7s0-alias-${i}"
     
-    echo "Creating DHCP reservation: $MAC → $IP (host: $HOST_NAME)"
+    echo "Creating DHCP reservation: $TARGET_INTERFACE_MAC → $IP (host: $HOST_NAME)"
     
-    # Add DHCP host reservation to the network
+    # Add DHCP host reservation to the network (same MAC, different IPs)
     virsh net-update "$NETWORK_NAME" add ip-dhcp-host \
-        "<host mac='$MAC' name='$HOST_NAME' ip='$IP'/>" \
+        "<host mac='$TARGET_INTERFACE_MAC' name='$HOST_NAME' ip='$IP'/>" \
         --live --config || {
-        echo "Warning: Failed to add DHCP reservation for $MAC → $IP"
+        echo "Warning: Failed to add DHCP reservation for $TARGET_INTERFACE_MAC → $IP"
         echo "This might be because the reservation already exists or there's a conflict"
     }
 done
@@ -122,44 +115,37 @@ if [ -z "$VM_IP" ]; then
     echo "Warning: Could not get VM IP address for automatic configuration"
     echo "Manual configuration required inside VM"
 else
-    echo "Configuring DHCP-based IP assignment inside VM via SSH..."
+    echo "Configuring IP aliasing inside VM via SSH..."
     
-    # Wait for interfaces to be detected
-    echo "Waiting for new interfaces to be detected..."
+    # Wait for DHCP reservations to be processed
+    echo "Waiting for DHCP reservations to be processed..."
     sleep 5
     
     # Apply the configuration via SSH
     if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$VM_IP "echo 'SSH connection test'" 2>/dev/null; then
-        echo "Generating complete netplan configuration..."
+        echo "Generating IP aliasing configuration..."
         
-        # Debug: Show what MAC addresses we have before generating config
-        echo "Debug: MAC_ARRAY contents before netplan generation:"
-        for i in "${!MAC_ARRAY[@]}"; do
-            echo "  MAC_ARRAY[$i] = '${MAC_ARRAY[$i]}'"
-        done
+        # Use enp7s0 interface for IP aliasing
+        TARGET_INTERFACE="enp7s0"
+        echo "Using interface: $TARGET_INTERFACE for IP aliasing"
         
-        # Create the complete netplan configuration using DHCP
-        # Build the configuration string with proper variable substitution
+        # Create netplan configuration for IP aliasing
         NETPLAN_CONFIG="network:
   version: 2
-  ethernets:"
-
-        for i in "${!IP_ARRAY[@]}"; do
-            SLOT=$((CURRENT_INTERFACES + i + 6))
-            IFACE="enp${SLOT}s0"
-            MAC="${MAC_ARRAY[$i]}"
-            
-            echo "Debug: Building config for $IFACE with MAC: $MAC"
-            
-            NETPLAN_CONFIG="$NETPLAN_CONFIG
-    $IFACE:
-      match:
-        macaddress: \"$MAC\"
+  ethernets:
+    $TARGET_INTERFACE:
       dhcp4: true
-      dhcp6: false"
+      dhcp6: false
+      addresses:"
+
+        # Add all additional IPs as static addresses
+        for i in "${!IP_ARRAY[@]}"; do
+            IP="${IP_ARRAY[$i]}"
+            NETPLAN_CONFIG="$NETPLAN_CONFIG
+        - $IP/24"
         done
         
-        echo "Debug: Complete NETPLAN_CONFIG:"
+        echo "Complete NETPLAN_CONFIG:"
         echo "$NETPLAN_CONFIG"
         
         # Apply the configuration via SSH
@@ -169,7 +155,7 @@ export APT_LISTCHANGES_FRONTEND=none
 export DEBIAN_FRONTEND=noninteractive
 
 # Create netplan configuration file
-NETPLAN_FILE="/etc/netplan/60-additional-interfaces.yaml"
+NETPLAN_FILE="/etc/netplan/60-ip-aliasing.yaml"
 
 # Create a backup if file exists
 if [ -f "\$NETPLAN_FILE" ]; then
@@ -177,7 +163,7 @@ if [ -f "\$NETPLAN_FILE" ]; then
 fi
 
 # Write the complete configuration
-echo "Creating DHCP-based netplan configuration with ${#IP_ARRAY[@]} interfaces..."
+echo "Creating IP aliasing netplan configuration with ${#IP_ARRAY[@]} additional IPs..."
 sudo tee "\$NETPLAN_FILE" > /dev/null << 'NETPLAN_EOF'
 $NETPLAN_CONFIG
 NETPLAN_EOF
@@ -195,12 +181,11 @@ echo "=== End configuration ==="
 sudo netplan generate
 sudo netplan apply
 
-# Restart networking to ensure DHCP reservations are picked up
-echo "Restarting networking services to pick up DHCP reservations..."
-sudo systemctl restart systemd-networkd
+# Wait for addresses to be configured
+echo "Waiting for IP addresses to be configured..."
 sleep 5
 
-echo "All interfaces configured successfully with DHCP reservations!"
+echo "IP aliasing configured successfully!"
 
 # Show all IPs to verify
 echo "All configured IPs:"
@@ -208,10 +193,10 @@ ip addr show | grep "inet " | grep -v "127.0.0.1"
 EOF
         
         if [ $? -eq 0 ]; then
-            echo "✅ All IP addresses configured successfully with DHCP reservations!"
-            echo "IPs should now appear in 'virsh net-dhcp-leases $NETWORK_NAME' and 'virsh domifaddr $VM_NAME'"
+            echo "✅ All IP addresses configured successfully using IP aliasing!"
+            echo "All IPs are now configured on interface: $TARGET_INTERFACE"
         else
-            echo "❌ Failed to apply network configuration via SSH"
+            echo "❌ Failed to apply IP aliasing configuration via SSH"
         fi
     else
         echo "❌ Could not connect to VM via SSH"
