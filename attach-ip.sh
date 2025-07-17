@@ -67,26 +67,20 @@ echo "Configuring ${#IP_ARRAY[@]} IP addresses for VM: $VM_NAME using IP aliasin
 echo "IPs: ${IP_ARRAY[*]}"
 echo "Network: $NETWORK_NAME"
 
-# Check current interfaces and ensure we have enp7s0 (7th interface)
+# Check if we already have enp7s0 interface
 CURRENT_INTERFACES=$(virsh domiflist "$VM_NAME" | awk 'NR>2 && NF>0 {print $1}' | wc -l)
 echo "Current interface count: $CURRENT_INTERFACES"
 
-# We need at least 7 interfaces to have enp7s0 (enp1s0, enp2s0, ..., enp7s0)
-TARGET_INTERFACE_COUNT=7
-if [ "$CURRENT_INTERFACES" -lt "$TARGET_INTERFACE_COUNT" ]; then
-    INTERFACES_TO_ADD=$((TARGET_INTERFACE_COUNT - CURRENT_INTERFACES))
-    echo "Adding $INTERFACES_TO_ADD interfaces to reach enp7s0..."
-    
-    for i in $(seq 1 $INTERFACES_TO_ADD); do
-        echo "Adding interface $i of $INTERFACES_TO_ADD..."
-        virsh attach-interface "$VM_NAME" network "$NETWORK_NAME" --model virtio --persistent
-        sleep 2
-    done
-    echo "All interfaces added successfully!"
+# We only need 1 additional interface for enp7s0 if we don't have it
+if [ "$CURRENT_INTERFACES" -lt 2 ]; then
+    echo "Adding 1 interface for enp7s0..."
+    virsh attach-interface "$VM_NAME" network "$NETWORK_NAME" --model virtio --persistent
+    sleep 2
+    echo "Interface enp7s0 created successfully!"
 fi
 
-# Get the 7th interface MAC address (enp7s0)
-TARGET_INTERFACE_MAC=$(virsh domiflist "$VM_NAME" | awk 'NR==9 && NF>=5 {print $5}')
+# Get the 2nd interface MAC address (enp7s0)
+TARGET_INTERFACE_MAC=$(virsh domiflist "$VM_NAME" | awk 'NR==4 && NF>=5 {print $5}')
 echo "Using enp7s0 interface with MAC: $TARGET_INTERFACE_MAC for IP aliasing"
 
 # Create DHCP reservations for IP aliasing
