@@ -47,7 +47,7 @@ Commands:
   Delete VM:  virsh destroy <vm-name> && virsh undefine <vm-name> --remove-all-storage
 
 $ juju add-machine ssh:ubuntu@192.168.122.223
-$ juju deploy k8s --to 0 --config load-balancer-enabled=true --config load-balancer-cidrs=192.168.122.10-192.168.122.20
+$ juju deploy k8s --to 0 --config load-balancer-enabled=true --config load-balancer-cidrs=192.168.122.10-192.168.122.20 --config dns-enabled=true
 $ juju run k8s/leader get-kubeconfig --format yaml | yq -r '."k8s/0".results.kubeconfig' | juju add-k8s k8scloud --client
 $ juju bootstrap k8scloud k8s-ctrl --debug --config controller-service-type=loadbalancer --config 'controller-external-ips=[192.168.122.10]'
 

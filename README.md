@@ -18,7 +18,7 @@ Ensure the following packages are installed on your Linux system:
 ```bash
 # Ubuntu/Debian
 sudo apt update
-sudo apt install libvirt-daemon-system libvirt-clients virt-install qemu-kvm genisoimage wget ssh
+sudo apt install libvirt-daemon-system libvirt-clients virt-manager qemu-kvm genisoimage wget ssh
 ```
 
 **System Requirements:**

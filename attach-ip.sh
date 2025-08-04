@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Attach multiple IP addresses to VMs using IP aliasing
+# Attach multiple IP addresses to VMs using IP aliasing on one new interface
 # Usage: ./attach-ip.sh <vm-name> <ip1,ip2,ip3,...> [network-name]
 
 set -e
@@ -17,7 +17,7 @@ show_usage() {
     echo "  $0 myvm 192.168.122.10,192.168.122.11     # Two IPs"
     echo "  $0 myvm 192.168.122.10,192.168.122.11,192.168.122.12  # Multiple IPs"
     echo ""
-    echo "Note: VM must be running. Uses IP aliasing to avoid PCI slot limits."
+    echo "Note: VM must be running. Adds one new interface and uses IP aliasing."
     echo "      Use 'virsh net-list' to see available networks."
     exit 1
 }
@@ -67,40 +67,42 @@ echo "Configuring ${#IP_ARRAY[@]} IP addresses for VM: $VM_NAME using IP aliasin
 echo "IPs: ${IP_ARRAY[*]}"
 echo "Network: $NETWORK_NAME"
 
-# Check if we already have enp7s0 interface
+# Check current interfaces and add only one new interface (enp7s0)
 CURRENT_INTERFACES=$(virsh domiflist "$VM_NAME" | awk 'NR>2 && NF>0 {print $1}' | wc -l)
 echo "Current interface count: $CURRENT_INTERFACES"
 
-# We only need 1 additional interface for enp7s0 if we don't have it
-if [ "$CURRENT_INTERFACES" -lt 2 ]; then
-    echo "Adding 1 interface for enp7s0..."
-    virsh attach-interface "$VM_NAME" network "$NETWORK_NAME" --model virtio --persistent
-    sleep 2
-    echo "Interface enp7s0 created successfully!"
-fi
+# Add only one new interface for enp7s0
+NEXT_INTERFACE_INDEX=$((CURRENT_INTERFACES + 1))
+echo "Adding one new interface (will become enp${NEXT_INTERFACE_INDEX}s0)..."
 
-# Get the 2nd interface MAC address (enp7s0)
-TARGET_INTERFACE_MAC=$(virsh domiflist "$VM_NAME" | awk 'NR==4 && NF>=5 {print $5}')
-echo "Using enp7s0 interface with MAC: $TARGET_INTERFACE_MAC for IP aliasing"
+virsh attach-interface "$VM_NAME" network "$NETWORK_NAME" --model virtio --persistent
+sleep 2
+echo "New interface added successfully!"
+
+# Get the newly added interface MAC address (last interface)
+LAST_INTERFACE_LINE=$((CURRENT_INTERFACES + 3))  # +3 because of header lines
+TARGET_INTERFACE_MAC=$(virsh domiflist "$VM_NAME" | awk "NR==$LAST_INTERFACE_LINE && NF>=5 {print \$5}")
+TARGET_INTERFACE="enp${NEXT_INTERFACE_INDEX}s0"
+echo "Using new interface $TARGET_INTERFACE with MAC: $TARGET_INTERFACE_MAC for IP aliasing"
 
 # Create DHCP reservations for IP aliasing
-echo "Creating DHCP reservations for IP aliasing..."
-for i in "${!IP_ARRAY[@]}"; do
-    IP="${IP_ARRAY[$i]}"
-    HOST_NAME="${VM_NAME}-enp7s0-alias-${i}"
-    
-    echo "Creating DHCP reservation: $TARGET_INTERFACE_MAC → $IP (host: $HOST_NAME)"
-    
-    # Add DHCP host reservation to the network (same MAC, different IPs)
-    virsh net-update "$NETWORK_NAME" add ip-dhcp-host \
-        "<host mac='$TARGET_INTERFACE_MAC' name='$HOST_NAME' ip='$IP'/>" \
-        --live --config || {
-        echo "Warning: Failed to add DHCP reservation for $TARGET_INTERFACE_MAC → $IP"
-        echo "This might be because the reservation already exists or there's a conflict"
-    }
-done
-
-echo "DHCP reservations created successfully!"
+# echo "Creating DHCP reservations for IP aliasing..."
+# for i in "${!IP_ARRAY[@]}"; do
+#     IP="${IP_ARRAY[$i]}"
+#     HOST_NAME="${VM_NAME}-${TARGET_INTERFACE}-alias-${i}"
+#     
+#     echo "Creating DHCP reservation: $TARGET_INTERFACE_MAC → $IP (host: $HOST_NAME)"
+#     
+#     # Add DHCP host reservation to the network (same MAC, different IPs)
+#     virsh net-update "$NETWORK_NAME" add ip-dhcp-host \
+#         "<host mac='$TARGET_INTERFACE_MAC' name='$HOST_NAME' ip='$IP'/>" \
+#         --live --config || {
+#         echo "Warning: Failed to add DHCP reservation for $TARGET_INTERFACE_MAC → $IP"
+#         echo "This might be because the reservation already exists or there's a conflict"
+#     }
+# done
+# 
+# echo "DHCP reservations created successfully!"
 
 # Get VM IP for SSH connection
 VM_IP=$(virsh domifaddr "$VM_NAME" | awk 'NR==3{print $4}' | cut -d'/' -f1)
@@ -119,15 +121,21 @@ else
     if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$VM_IP "echo 'SSH connection test'" 2>/dev/null; then
         echo "Generating IP aliasing configuration..."
         
-        # Use enp7s0 interface for IP aliasing
-        TARGET_INTERFACE="enp7s0"
-        echo "Using interface: $TARGET_INTERFACE for IP aliasing"
+        # Get the actual interface name that corresponds to our MAC address
+        ACTUAL_TARGET_INTERFACE=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$VM_IP "ip link show | grep -B1 '$TARGET_INTERFACE_MAC' | head -1 | awk '{print \$2}' | sed 's/:$//'")
+        
+        if [ -z "$ACTUAL_TARGET_INTERFACE" ]; then
+            echo "Error: Could not find interface with MAC $TARGET_INTERFACE_MAC"
+            exit 1
+        fi
+        
+        echo "Using interface: $ACTUAL_TARGET_INTERFACE (MAC: $TARGET_INTERFACE_MAC) for IP aliasing"
         
         # Create netplan configuration for IP aliasing
         NETPLAN_CONFIG="network:
   version: 2
   ethernets:
-    $TARGET_INTERFACE:
+    $ACTUAL_TARGET_INTERFACE:
       dhcp4: true
       dhcp6: false
       addresses:"
@@ -188,7 +196,7 @@ EOF
         
         if [ $? -eq 0 ]; then
             echo "✅ All IP addresses configured successfully using IP aliasing!"
-            echo "All IPs are now configured on interface: $TARGET_INTERFACE"
+            echo "All IPs are now configured on interface: $ACTUAL_TARGET_INTERFACE"
         else
             echo "❌ Failed to apply IP aliasing configuration via SSH"
         fi
